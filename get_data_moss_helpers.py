@@ -1,210 +1,418 @@
-from IPython.display import display, HTML
-import numpy as np
-import branca.colormap as cm
-from shapely.geometry import box
-import folium
-import geopandas as gpd
-import matplotlib.pyplot as plt
-import rasterio
 import requests
-import zipfile
-import os
+import geopandas as gpd
+from shapely.geometry import box, Point
+import folium
+import branca.colormap as cm
+import numpy as np
+from IPython.display import display, HTML
+
+# ============================================================
+# Load COMNAP facilities (from latitude/longitude attributes)
+# ============================================================
 
 
-def download_and_extract_lima(url="https://lima.usgs.gov/tiff_90pct.zip",
-                              zip_name="tiff_90pct.zip",
-                              extract_dir="tiff_90pct",
-                              specific_tif="tiff_90pct/00000-20080319-092059124.tif"):
-    """
-    Download a zipped LIMA dataset, extract it, and return path to a specific GeoTIFF.
-
-    Parameters:
-    - url: URL of the zip file
-    - zip_name: name to save the downloaded zip locally
-    - extract_dir: directory to extract the files
-    - specific_tif: relative path inside the zip to a specific GeoTIFF
-
-    Returns:
-    - tif_path: full path to the requested GeoTIFF
-    """
-    cwd = os.getcwd()
-    print(f"Current working directory: {cwd}")
-
-    # 1. Download
-    zip_path = os.path.join(cwd, zip_name)
-    print(f"Downloading file to: {zip_path} ...")
-    response = requests.get(url)
-    with open(zip_path, "wb") as f:
-        f.write(response.content)
-    print("Download complete.")
-
-    # 2. Extract
-    extract_path = os.path.join(cwd, extract_dir)
-    print(f"Extracting files to: {extract_path} ...")
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_path)
-    print("Extraction complete.")
-
-    # 3. Build path to specific GeoTIFF
-    tif_path = os.path.join(extract_path, specific_tif)
-    print(f"GeoTIFF path: {tif_path}")
-
-    print("LIMA base map downloaded successfully.")
-    return tif_path
-
-
-def plot_species_on_lima(region_bbox, species_col,
-                         lima_path=r"C:\Users\ANTNZDEV\michaelmeredythyoung\mapping3\lima\00000-20080319-092059124.tif",
-                         shapefile_path=r"C:\Users\ANTNZDEV\OneDrive - Antarctica New Zealand\Documents\ANTNZDEV\github_dashboard_products\Moss-Shiny-App\all_pred_prob.shp"):
-    """
-    Plot LIMA raster with Antarctic species probabilities from shapefile.
-
-    Parameters
-    ----------
-    region_bbox : tuple
-        (xmin, xmax, ymin, ymax) in meters for the area to zoom in.
-    species_col : str
-        Column name in shapefile representing the species probability.
-    lima_path : str
-        Path to LIMA raster file.
-    shapefile_path : str
-        Path to Antarctic shapefile with species probability columns.
-    """
-
-    # -----------------------
-    # 1. Load LIMA raster
-    # -----------------------
-    with rasterio.open(lima_path) as src:
-        lima_data = src.read([1, 2, 3])  # RGB bands
-        lima_extent = (src.bounds.left, src.bounds.right,
-                       src.bounds.bottom, src.bounds.top)
-        lima_crs = src.crs
-
-    lima_img = lima_data.transpose(1, 2, 0)  # rows, cols, RGB
-
-    # -----------------------
-    # 2. Load shapefile
-    # -----------------------
-    gdf = gpd.read_file(shapefile_path)
-
-    # -----------------------
-    # 3. Reproject shapefile to match raster CRS
-    # -----------------------
-    gdf = gdf.to_crs(lima_crs)
-
-    # -----------------------
-    # 4. Plot raster and shapefile
-    # -----------------------
-    xmin, xmax, ymin, ymax = region_bbox
-    plt.figure(figsize=(12, 12))
-    plt.imshow(lima_img, extent=lima_extent)
-    plt.xlim(xmin, xmax)
-    plt.ylim(ymin, ymax)
-
-    # Plot shapefile polygons colored by species probabilities
-    gdf.plot(
-        ax=plt.gca(),
-        column=species_col,
-        cmap="viridis",
-        alpha=0.6,
-        edgecolor="black",
-        linewidth=0.5,
-        legend=True
+def load_comnap_data():
+    url = (
+        "https://services7.arcgis.com/tPxy1hrFDhJfZ0Mf/ArcGIS/rest/services/"
+        "COMNAP_Antarctic_Facilities_Master/FeatureServer/0/query"
     )
 
-    plt.xlabel("Easting (m)")
-    plt.ylabel("Northing (m)")
-    plt.title(f"LIMA Raster with {species_col} Probability Overlay")
-    plt.show()
+    params = {
+        "where": "1=1",
+        "outFields": "*",
+        "f": "json",
+        "returnGeometry": "false",
+    }
+
+    resp = requests.get(url, params=params).json()
+
+    rows = []
+    for f in resp["features"]:
+        a = f.get("attributes", {})
+        lat = a.get("Latitude__")
+        lon = a.get("Longitude")
+
+        if lat is None or lon is None:
+            continue
+
+        rows.append({**a, "geometry": Point(float(lon), float(lat))})
+
+    return gpd.GeoDataFrame(rows, geometry="geometry", crs=4326)
 
 
-def create_probability_map(shapefile_path, species, region_bbox=None, n_ticks=5):
-    """
-    Create an interactive Folium probability map with:
-    - Continuous gradient colour bar outside the map
-    - Numeric tick values in black
-    - Label on top of the colour bar
-    - Google satellite basemap
-    """
-    # 1. Load shapefile
-    gdf = gpd.read_file(shapefile_path).to_crs(epsg=4326)
-    if species not in gdf.columns:
-        raise ValueError(f"Column '{species}' not found in shapefile")
-    gdf = gdf[~gdf[species].isna()].copy()
-    if gdf.empty:
-        raise ValueError("No valid polygons to plot")
+# ============================================================
+# FULL MAP FUNCTION (moss + COMNAP + ASPA)
+# ============================================================
 
-    # 2. Clip to bounding box if provided
-    if region_bbox is not None:
-        xmin, xmax, ymin, ymax = region_bbox
-        bbox_gdf = gpd.GeoDataFrame(
-            geometry=[box(xmin, ymin, xmax, ymax)], crs=4326)
+def create_moss_probability_map(
+    moss_data,
+    species,
+    aspa_gdf=None,
+    comnap_gdf=None,
+    region_bbox=None,
+    n_ticks=5
+):
+
+    # -----------------------------
+    # 0. Species name lookup table
+    # -----------------------------
+    species_names = {
+        "ADep": "Andreaea depressinernis",
+        "AGai": "Andreaea gainii",
+        "AReg": "Andreaea regularis",
+        "BPat": "Bartramia patens",
+        "BDry": "Blindia dryptodontoides",
+        "BAus": "Brachythecium austrosalebrosum",
+        "BAmb": "Bryum amblyodon",
+        "BArg": "Bryum argenteum",
+        "BPse": "Bryum pseudotriquetrum",
+        "CPur": "Ceratodon purpureus",
+        "CAci": "Chorisodontium aciphyllum",
+        "CLaw": "Coscinodon lawianus",
+        "DBra": "Didymodon brachyphyllus",
+        "DCap": "Distichium capillaceum",
+        "HHei": "Hennediella heimii",
+        "PCru": "Pohlia cruda",
+        "PNut": "Pohlia nutans",
+        "PAlp": "Polytrichastrum alpinum",
+        "PPil": "Polytrichum piliferum",
+        "PStr": "Polytrichum strictum",
+        "SGeo": "Sanionia georgicouncinata",
+        "SUnc": "Sanionia uncinata",
+        "SGla": "Sarconeurum glaciale",
+        "SAnt": "Schistidium antarctici",
+        "SFil": "Syntrichia filaris",
+        "SPri": "Syntrichia princeps",
+        "SSax": "Syntrichia saxicola",
+        "WFon": "Warnstorfia fontinaliopsis"
+    }
+
+    full_name = species_names.get(species, species)
+
+    # -----------------------------
+    # 1. Prepare moss polygons
+    # -----------------------------
+    moss_data = moss_data.set_crs(epsg=3031, allow_override=True)
+    moss = moss_data.to_crs(4326).dropna(subset=[species])
+    # Create a formatted display column rounded to 3 d.p.
+    moss["display_val"] = moss[species].round(3)
+
+    if region_bbox:
+        min_lon, max_lon, min_lat, max_lat = region_bbox
+        box_poly = box(min_lon, min_lat, max_lon, max_lat)
+        bbox = gpd.GeoDataFrame(geometry=[box_poly], crs=4326)
+
         try:
-            gdf = gpd.overlay(gdf, bbox_gdf, how="intersection")
+            moss = gpd.overlay(moss, bbox, how="intersection")
         except Exception:
-            gdf = gpd.clip(gdf, bbox_gdf)
-        if gdf.empty:
-            raise ValueError("No polygons intersect the bounding box")
-        center_lon = (xmin + xmax)/2
-        center_lat = (ymin + ymax)/2
-    else:
-        minx, miny, maxx, maxy = gdf.total_bounds
-        center_lon = (minx + maxx)/2
-        center_lat = (miny + maxy)/2
+            moss = gpd.clip(moss, bbox)
 
-    # 3. Colour scale
-    vmin = float(np.nanmin(gdf[species]))
-    vmax = float(np.nanmax(gdf[species]))
+        center_lon = (min_lon + max_lon) / 2
+        center_lat = (min_lat + max_lat) / 2
+
+    else:
+        minx, miny, maxx, maxy = moss.total_bounds
+        center_lon = (minx + maxx) / 2
+        center_lat = (miny + maxy) / 2
+
+    # -----------------------------
+    # 2. Prepare ASPA polygons
+    # -----------------------------
+    aspa_clip = None
+    if aspa_gdf is not None:
+        aspa_4326 = aspa_gdf.to_crs(4326)
+
+        if region_bbox:
+            try:
+                aspa_clip = gpd.overlay(aspa_4326, bbox, how="intersection")
+            except Exception:
+                aspa_clip = gpd.clip(aspa_4326, bbox)
+        else:
+            aspa_clip = aspa_4326
+
+        aspa_clip = aspa_clip[~aspa_clip.is_empty]
+
+    # -----------------------------
+    # 3. Prepare colour scale
+    # -----------------------------
+    vmin = moss[species].min()
+    vmax = moss[species].max()
     colormap = cm.linear.YlGnBu_09.scale(vmin, vmax)
 
-    # 4. Create Folium map
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=7)
+    # -----------------------------
+    # 4. Create map
+    # -----------------------------
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=6)
+
+    # --- Google satellite ---
     folium.TileLayer(
         tiles="http://www.google.cn/maps/vt?lyrs=s@189&gl=cn&x={x}&y={y}&z={z}",
-        attr="Google",
+        attr="Google Satellite",
         name="Google Satellite"
     ).add_to(m)
 
-    # 5. Colour polygons
-    def style_function(feature):
-        val = feature["properties"].get(species, None)
-        try:
-            color = colormap(float(val))
-        except:
-            color = "#00000000"
-        return {"fillColor": color, "color": "black", "weight": 0.5, "fillOpacity": 0.7}
-
+    # -----------------------------
+    # 5. Moss polygons (tooltip updated)
+    # -----------------------------
     folium.GeoJson(
-        gdf,
-        style_function=style_function,
-        tooltip=folium.GeoJsonTooltip(fields=[species], aliases=[
-                                      f"{species}:"], sticky=True)
+        moss,
+        name="Moss probability",
+        style_function=lambda f: {
+            "fillColor": colormap(f["properties"][species]),
+            "color": "black",
+            "weight": 0.3,
+            "fillOpacity": 0.7,
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=["display_val"],
+            aliases=[full_name]     # <──── FULL NAME
+        )
     ).add_to(m)
-    folium.LayerControl().add_to(m)
 
-    # 6. External continuous gradient with numeric black labels
-    tick_values = np.linspace(vmin, vmax, n_ticks)
-    tick_labels = [f"{t:.2f}" for t in tick_values]
+    # -----------------------------
+    # 6. COMNAP stations
+    # -----------------------------
+    if comnap_gdf is not None:
+        comnap_4326 = comnap_gdf.to_crs(4326)
 
-    # High-resolution gradient for smooth display
-    gradient_positions = np.linspace(0, 100, 256)
-    gradient_colors = [colormap(vmin + (vmax-vmin)*p/100)
-                       for p in gradient_positions]
-    gradient_css = "linear-gradient(to right, " + \
-        ", ".join(gradient_colors) + ")"
+        if region_bbox:
+            comnap_4326 = comnap_4326[
+                (comnap_4326.geometry.x >= min_lon) &
+                (comnap_4326.geometry.x <= max_lon) &
+                (comnap_4326.geometry.y >= min_lat) &
+                (comnap_4326.geometry.y <= max_lat)
+            ]
 
-    # Build HTML for colourbar with label on top
-    html = f"""
-    <div style="width:400px; margin-bottom:10px; font-family:sans-serif;">
-        <div style="color:black; font-weight:bold; margin-bottom:5px;">{species} probability</div>
-        <div style="height:25px; border-radius:5px; background:{gradient_css};"></div>
-        <div style="display:flex; justify-content:space-between; color:black; font-weight:bold; margin-top:3px;">
-            {''.join(f'<span>{label}</span>' for label in tick_labels)}
+        for _, row in comnap_4326.iterrows():
+            geom = row.geometry
+            if geom is None or geom.geom_type != "Point":
+                continue
+
+            folium.CircleMarker(
+                location=[geom.y, geom.x],
+                radius=5,
+                color="red",
+                fill=True,
+                fill_color="red",
+                fill_opacity=0.9,
+                tooltip=folium.Tooltip(
+                    row.get("English_Na", ""),
+                    sticky=True
+                )
+            ).add_to(m)
+
+    # -----------------------------
+    # 7. ASPA boundaries (unchanged)
+    # -----------------------------
+    if aspa_clip is not None and not aspa_clip.empty:
+        folium.GeoJson(
+            aspa_clip,
+            name="ASPA Boundaries",
+            style_function=lambda f: {
+                "fillColor": "#ff7800",
+                "color": "#ff0000",
+                "weight": 2,
+                "fillOpacity": 0.15,
+            },
+            tooltip=folium.GeoJsonTooltip(fields=["ASPA_No", "NAME"])
+        ).add_to(m)
+
+    # -----------------------------
+    # 8. Colour bar (title uses FULL NAME)
+    # -----------------------------
+    ticks = np.linspace(vmin, vmax, n_ticks)
+    labels = [f"{t:.2f}" for t in ticks]
+    gradient = ", ".join(colormap(vmin + (vmax - vmin) * i / 100)
+                         for i in range(100))
+
+    display(HTML(f"""
+        <div style="width:400px;margin-bottom:10px">
+            <div style="font-weight:bold;">Probability - {full_name}</div>
+            <div style="height:25px;background:linear-gradient(to right,{gradient});border-radius:5px;"></div>
+            <div style="display:flex;justify-content:space-between;">
+                {''.join(f'<span>{l}</span>' for l in labels)}
+            </div>
         </div>
-    </div>
+    """))
+
+    folium.LayerControl().add_to(m)
+    return m
+
+
+def create_moss_richness_map(moss_data, aspa_gdf=None, comnap_gdf=None,
+                             region_bbox=None, n_ticks=6):
+    """
+    Creates a folium map showing:
+    - Species richness (sum over all species columns)
+    - ASPA polygons
+    - COMNAP facilities
     """
 
-    # Display in Jupyter notebook
-    display(HTML(html))
-    display(m)
-    return m, colormap
+    # -------------------------------------------
+    # Ensure moss data has correct CRS
+    # -------------------------------------------
+    moss_data = moss_data.set_crs(epsg=3031, allow_override=True)
+
+    # -------------------------------------------
+    # Identify species columns (everything except geometry)
+    # -------------------------------------------
+    species_cols = [
+        c for c in moss_data.columns
+        if c not in ("geometry", "spatial_ref")
+    ]
+
+    if len(species_cols) == 0:
+        raise ValueError("No species columns detected in moss dataset.")
+
+    # -------------------------------------------
+    # Compute species richness
+    # -------------------------------------------
+    moss_data["richness"] = moss_data[species_cols].sum(axis=1)
+
+    moss_data["richness_display"] = moss_data["richness"].astype(int)
+
+    # Convert to lat/lon
+    moss = moss_data.to_crs(4326)
+
+    # -------------------------------------------
+    # Optional bounding box
+    # -------------------------------------------
+    if region_bbox:
+        min_lon, max_lon, min_lat, max_lat = region_bbox
+        bbox_poly = box(min_lon, min_lat, max_lon, max_lat)
+        bbox = gpd.GeoDataFrame(geometry=[bbox_poly], crs=4326)
+
+        try:
+            moss = gpd.overlay(moss, bbox, how="intersection")
+        except:
+            moss = gpd.clip(moss, bbox)
+
+        center_lon = (min_lon + max_lon) / 2
+        center_lat = (min_lat + max_lat) / 2
+    else:
+        minx, miny, maxx, maxy = moss.total_bounds
+        center_lon = (minx + maxx) / 2
+        center_lat = (miny + maxy) / 2
+
+    # -------------------------------------------
+    # ASPA polygons
+    # -------------------------------------------
+    aspa_clip = None
+    if aspa_gdf is not None:
+        aspa_4326 = aspa_gdf.to_crs(4326)
+
+        if region_bbox:
+            try:
+                aspa_clip = gpd.overlay(aspa_4326, bbox, how="intersection")
+            except:
+                aspa_clip = gpd.clip(aspa_4326, bbox)
+        else:
+            aspa_clip = aspa_4326
+
+        aspa_clip = aspa_clip[~aspa_clip.is_empty]
+
+    # -------------------------------------------
+    # Colour ramp (integer richness)
+    # -------------------------------------------
+    vmin = int(moss["richness"].min())
+    vmax = int(moss["richness"].max())
+
+    # Round vmax up to nearest 5
+    vmax_rounded = int(np.ceil(vmax / 5) * 5)
+
+    colormap = cm.linear.YlGnBu_09.scale(vmin, vmax_rounded)
+
+    # -------------------------------------------
+    # Create map
+    # -------------------------------------------
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=6)
+
+    folium.TileLayer(
+        tiles="http://www.google.cn/maps/vt?lyrs=s@189&gl=cn&x={x}&y={y}&z={z}",
+        attr="Google Satellite",
+        name="Google Satellite"
+    ).add_to(m)
+
+    # -------------------------------------------
+    # Moss richness polygons
+    # -------------------------------------------
+    folium.GeoJson(
+        moss,
+        name="Species Richness",
+        style_function=lambda f: {
+            "fillColor": colormap(f["properties"]["richness"]),
+            "color": "black",
+            "weight": 0.3,
+            "fillOpacity": 0.7,
+        },
+        tooltip=folium.GeoJsonTooltip(fields=["richness_display"],
+                                      aliases=["Species richness"])
+    ).add_to(m)
+
+    # -------------------------------------------
+    # COMNAP stations
+    # -------------------------------------------
+    if comnap_gdf is not None:
+        comnap_f = comnap_gdf.to_crs(4326)
+
+        if region_bbox:
+            min_lon, max_lon, min_lat, max_lat = region_bbox
+            comnap_f = comnap_f[
+                (comnap_f.geometry.x >= min_lon) &
+                (comnap_f.geometry.x <= max_lon) &
+                (comnap_f.geometry.y >= min_lat) &
+                (comnap_f.geometry.y <= max_lat)
+            ]
+
+        for _, row in comnap_f.iterrows():
+            g = row.geometry
+            if g.geom_type != "Point":
+                continue
+            folium.CircleMarker(
+                location=[g.y, g.x],
+                radius=6,
+                color=None,        # no outline stroke
+                weight=0,
+                fill=True,
+                fill_color="red",
+                fill_opacity=0.9,
+                tooltip=row.get("English_Na", "")
+            ).add_to(m)
+
+    # -------------------------------------------
+    # ASPA boundaries
+    # -------------------------------------------
+    if aspa_clip is not None:
+        folium.GeoJson(
+            aspa_clip,
+            name="ASPA Boundaries",
+            style_function=lambda f: {
+                "fillColor": "#ff7800",
+                "color": "#ff0000",
+                "weight": 2,
+                "fillOpacity": 0.15
+            },
+            tooltip=folium.GeoJsonTooltip(fields=["ASPA_No", "NAME"])
+        ).add_to(m)
+
+    # -------------------------------------------
+    # Colour bar above map
+    # -------------------------------------------
+    ticks = np.linspace(vmin, vmax_rounded, n_ticks, dtype=int)
+    labels = [str(int(t)) for t in ticks]
+
+    gradient = ", ".join(colormap(vmin + i*(vmax_rounded-vmin)/100)
+                         for i in range(100))
+
+    display(HTML(f"""
+        <div style="width:450px; margin-bottom:10px; font-family:sans-serif;">
+            <b>Moss Species Richness (number of species)</b>
+            <div style="height:25px; background:linear-gradient(to right, {gradient}); border-radius:5px;"></div>
+            <div style="display:flex; justify-content:space-between;">
+                {''.join(f'<span>{l}</span>' for l in labels)}
+            </div>
+        </div>
+    """))
+
+    folium.LayerControl().add_to(m)
+    return m
