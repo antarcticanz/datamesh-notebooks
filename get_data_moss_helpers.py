@@ -5,6 +5,8 @@ import folium
 import branca.colormap as cm
 import numpy as np
 from IPython.display import display, HTML
+import zipfile
+import io
 
 # ============================================================
 # Load COMNAP facilities (from latitude/longitude attributes)
@@ -416,3 +418,27 @@ def create_moss_richness_map(moss_data, aspa_gdf=None, comnap_gdf=None,
 
     folium.LayerControl().add_to(m)
     return m
+
+
+
+
+def load_aspa_polygons():
+    """
+    Load ASPA polygons shapefile (v5, 2024) directly from GitHub.
+    Returns a GeoDataFrame.
+    """
+    url = "https://raw.githubusercontent.com/antarcticanz/datamesh-notebooks/main/data/ASPAs_polygons_v5_2024.zip"
+
+    # Download ZIP
+    resp = requests.get(url)
+    resp.raise_for_status()
+    zip_bytes = io.BytesIO(resp.content)
+
+    # Open ZIP and locate the .shp file
+    zf = zipfile.ZipFile(zip_bytes)
+    shp_name = [name for name in zf.namelist() if name.endswith(".shp")][0]
+
+    # Load the shapefile directly from the in-memory zip
+    gdf = gpd.read_file(f"zip://{shp_name}", storage_options={"fo": zip_bytes})
+
+    return gdf
