@@ -1,3 +1,5 @@
+from pathlib import Path
+import os
 import requests
 import geopandas as gpd
 from shapely.geometry import box, Point
@@ -7,6 +9,8 @@ import numpy as np
 from IPython.display import display, HTML
 import zipfile
 import io
+from pathlib import Path
+
 
 # ============================================================
 # Load COMNAP facilities (from latitude/longitude attributes)
@@ -420,25 +424,38 @@ def create_moss_richness_map(moss_data, aspa_gdf=None, comnap_gdf=None,
     return m
 
 
-
-
-def load_aspa_polygons():
+def load_aspa_polygons(local_dir="data_cache"):
     """
-    Load ASPA polygons shapefile (v5, 2024) directly from GitHub.
-    Returns a GeoDataFrame.
+    Download ASPA polygons ZIP from GitHub (once) and load it locally.
+    Keeps a cached copy on disk to avoid repeated downloads.
     """
-    url = "https://raw.githubusercontent.com/antarcticanz/datamesh-notebooks/main/data/ASPAs_polygons_v5_2024.zip"
 
-    # Download ZIP
-    resp = requests.get(url)
-    resp.raise_for_status()
-    zip_bytes = io.BytesIO(resp.content)
+    # Where to store the local copy
+    local_dir = Path(local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
 
-    # Open ZIP and locate the .shp file
-    zf = zipfile.ZipFile(zip_bytes)
-    shp_name = [name for name in zf.namelist() if name.endswith(".shp")][0]
+    zip_path = local_dir / "ASPAs_polygons_v5_2024.zip"
 
-    # Load the shapefile directly from the in-memory zip
-    gdf = gpd.read_file(f"zip://{shp_name}", storage_options={"fo": zip_bytes})
+    # If ZIP is not already downloaded, fetch it
+    if not zip_path.exists():
+        url = "https://raw.githubusercontent.com/antarcticanz/datamesh-notebooks/main/data/ASPAs_polygons_v5_2024.zip"
+        print("Downloading ASPA polygons…")
 
-    return gdf
+        resp = requests.get(url)
+        resp.raise_for_status()
+
+        with open(zip_path, "wb") as f:
+            f.write(resp.content)
+
+    # Read shapefile from the local ZIP
+    with zipfile.ZipFile(zip_path, "r") as z:
+        shp_name = [name for name in z.namelist() if name.endswith(".shp")][0]
+        extract_dir = local_dir / "aspa_polygons_extracted"
+
+        # Extract once
+        if not extract_dir.exists():
+            z.extractall(extract_dir)
+
+        # Now load using GeoPandas
+        shp_path = extract_dir / shp_name
+        return gpd.read_file(shp_path)
